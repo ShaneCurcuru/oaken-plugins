@@ -111,7 +111,7 @@ class JSONClient:
                 if resp.status_code >= 500:
                     if last:
                         raise AIBackendError(f"{self.who}: {self.service} answered {resp.status_code}")
-                elif resp.status_code >= 400:
+                elif resp.status_code >= 300:  # a 4xx, or a redirect (never followed: it could point off the machine)
                     raise AIBackendError(f"{self.who}: {self.service} answered {resp.status_code}")
                 else:
                     try:

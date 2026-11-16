@@ -73,6 +73,20 @@ async def test_headers_go_with_every_request() -> None:
     await client.close()
 
 
+async def test_a_redirect_is_an_error_and_is_not_followed() -> None:
+    seen: list[str] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        seen.append(str(request.url))
+        return httpx2.Response(307, headers={"location": "http://elsewhere.invalid/api/chat"}, json={"ok": True})
+
+    client = JSONClient(HTTPBackendConfig(base_url="http://127.0.0.1:11434", backoff=0), "t", "Ollama", transport=httpx2.MockTransport(handle))
+    with pytest.raises(AIBackendError, match="Ollama answered 307"):
+        await client.call("POST", "/api/chat", {"messages": []})
+    assert seen == ["http://127.0.0.1:11434/api/chat"]  # one request, to this machine only
+    await client.close()
+
+
 def test_settings_errors_name_the_field_and_not_its_value() -> None:
     with pytest.raises(PluginError, match=r"invalid \[plugins.t\] settings \(timeout\)") as raised:
         HTTPBackendConfig.parse({"base_url": "http://127.0.0.1:1", "timeout": -5}, "t")
