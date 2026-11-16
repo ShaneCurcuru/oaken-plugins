@@ -88,6 +88,12 @@ async def sync(core: Core) -> Any:
     return (await core.runner.jobs.query(kind="plugin.work.sync", limit=1))[0]
 
 
+async def seen(core: Core) -> dict[str, list[str]]:
+    """What the provider's records say it has sent, by folder."""
+    rows = await core.client.svc.db.fetchall("SELECT data_json FROM records WHERE collection = 'maildir_seen'")
+    return {d["folder"]: d["seen"] for d in (json.loads(r["data_json"]) for r in rows)}
+
+
 def result(job: Any) -> dict[str, Any]:
     assert job.status == "succeeded", job.last_error
     return json.loads(job.result_json)
@@ -114,8 +120,7 @@ async def test_a_reader_marking_mail_read_is_not_new_mail(core: Core, root: Path
     await sync(core)
     p.rename(root / "cur" / (p.name + ":2,S"))  # a mail reader moves it to cur/ and adds the Seen flag
     assert result(await sync(core))["submitted"] == 0
-    rows = await core.client.svc.db.fetchall("SELECT uniq FROM maildir_seen WHERE account = 'work'")
-    assert [r["uniq"] for r in rows] == [p.name] and (await stored(core)).total == 1
+    assert await seen(core) == {"INBOX": [p.name]} and (await stored(core)).total == 1
 
 
 async def test_mail_copied_in_with_an_old_mtime_is_still_found(core: Core, root: Path) -> None:
@@ -130,7 +135,7 @@ async def test_a_lost_record_reads_everything_again_and_stores_nothing_twice(cor
     drop(root, 1)
     drop(root, 2)
     await sync(core)
-    await core.client.svc.db.execute("DELETE FROM maildir_seen")
+    await core.client.svc.db.execute("DELETE FROM records WHERE collection = 'maildir_seen'")
     await sync(core)
     assert (await stored(core)).total == 2  # the ingestor knows a message by its Message-ID
 
@@ -141,8 +146,7 @@ async def test_a_deleted_message_leaves_the_record(core: Core, root: Path) -> No
     await sync(core)
     p.unlink()
     await sync(core)
-    rows = await core.client.svc.db.fetchall("SELECT uniq FROM maildir_seen WHERE account = 'work'")
-    assert len(rows) == 1
+    assert len((await seen(core))["INBOX"]) == 1
 
 
 async def test_everything_is_confidential_by_default_and_the_message_survives_as_it_was(core: Core, root: Path) -> None:

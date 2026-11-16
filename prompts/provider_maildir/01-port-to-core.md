@@ -14,7 +14,7 @@ secrets. Make it useful for a large Thunderbird archive.
   job on a schedule (`poll_seconds`), the `_live` hand-off so a reloaded instance still syncs, a `check` command that submits nothing.
 - **Submission matches IMAP and Gmail**: raw bytes as `{"base64": ...}`, `format = "rfc822"`, `key = "maildir:<instance>:<folder>:<unique>"`.
   The formatter splits, the dedupe triager drops a repeated key, the `mail` ingestor stores by Message-ID.
-- **A seen-set, not an mtime cursor.** Table `maildir_seen(account, folder, uniq)`. The unique name (file name before `:`) survives a flag
+- **A seen-set, not an mtime cursor.** One record per folder in the record store (`ctx.store`, collection `maildir_seen`), as the maintainer's in-flight `plugin-icons` branch moves imap's cursor; no plugin SQL. The unique name (file name before `:`) survives a flag
   change and the move from `new/` to `cur/`. An mtime cursor missed mail copied in with an old mtime. Rows for vanished files are pruned.
 - **Folders.** A plain Maildir is `INBOX`; Maildir++ `.A.B` is `A/B`; any other subdirectory tree is walked, as Thunderbird's maildir store
   keeps one (`Lists.sbd/apache/` is `Lists/apache`). Trash and Junk never sync (by name: a Maildir has no special-use flags).

@@ -6,13 +6,14 @@ the IMAP provider does: each message goes in as raw RFC 822 bytes (base64 in JSO
 and a key naming the account, folder and Maildir unique name, so Intake splits it, the dedupe triager drops a repeat, and the ``mail``
 ingestor stores it. Nothing here parses mail or stores it. It is read-only: it never renames, flags, moves or deletes a file.
 
-A template: each instance is one Maildir (or tree of them), with its own record and schedule. The record is a set: per folder, the unique
-names already submitted. A timestamp would miss mail copied in with an old modification time (an rsync, an import); a set does not. A
-reader's flag change renames ``1700000000.M1P2.host:2,`` to ``...:2,S`` and moves it from ``new/`` to ``cur/``; the unique name, before
-the ``:``, stays, so it is not sent again.
+A template: each instance is one Maildir (or tree of them), with its own records and schedule. Its record, one per folder in the record
+store, is a set: the unique names already submitted. A timestamp would miss mail copied in with an old modification time (an rsync, an
+import); a set does not. A reader's flag change renames ``1700000000.M1P2.host:2,`` to ``...:2,S`` and moves it from ``new/`` to ``cur/``;
+the unique name, before the ``:``, stays, so it is not sent again.
 
-shortcut: every sync lists every folder (one ``scandir`` per ``new/`` and ``cur/``) and loads the folder's set; fine for tens of thousands of
-messages. Upgrade to skipping a folder whose ``new/`` and ``cur/`` modification times have not moved if a store gets much bigger.
+shortcut: every sync lists every folder (one ``scandir`` per ``new/`` and ``cur/``) and rewrites a folder's record every 500 messages;
+fine for tens of thousands of messages per folder. Upgrade to skipping a folder whose ``new/`` and ``cur/`` modification times have not
+moved if a store gets much bigger.
 """
 
 import asyncio
@@ -20,7 +21,7 @@ import base64
 from pathlib import Path
 from typing import Any, ClassVar
 
-from oaken_core.errors import PluginError
+from oaken_core.errors import NotFound, PluginError
 from oaken_core.logging import get_logger
 from oaken_core.plugins.base import BaseProvider, BaseTemplatePlugin, command
 from oaken_core.plugins.contracts import (
@@ -37,7 +38,8 @@ from oaken_plugins.provider_maildir.config import MaildirConfig
 
 log = get_logger("oaken_plugins.maildir")
 
-PAGE = 100  # the record is kept after this many messages, so a crash repeats at most a page (the key and the Message-ID absorb it)
+SEEN_COLLECTION = "maildir_seen"  # in the record store: one record per instance and folder, the unique names already submitted
+PAGE = 500  # the record is kept after this many messages, so a crash repeats at most a page (the key and the Message-ID absorb it)
 
 
 class Empty(BaseModel):
@@ -69,7 +71,7 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
     requires_core = ">=1.0.0,<2"  # the oaken-core versions it works with
     version: ClassVar[str] = "0.2.0"  # 0.1.0 was the oaken-mail plugin API version (pull); 0.2.0 is the port to oaken-core
     tags: ClassVar[tuple[str, ...]] = ("mail",)
-    migrations_dir: ClassVar[Path | None] = Path(__file__).parent / "migrations"
+    icon: ClassVar[str] = "bi-mailbox"  # mail kept in folders on this machine
     config_model = MaildirConfig
     config: MaildirConfig
     contextual: ClassVar[tuple[str, ...]] = ("path",)  # an instance is a Maildir: where it is
@@ -116,22 +118,32 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
         found = await asyncio.to_thread(tree.folders, root)
         return tree.to_sync(found, self.config.include_folders, self.config.exclude_folders)
 
-    # -- the record: which unique names each folder has handed over ---------------------------
+    # -- the record: which unique names each folder has handed over, one store record per folder ---------------
+    def _rid(self, folder: str) -> str:
+        return f"{self.ctx.name}/{folder}"
+
     async def _seen(self, folder: str) -> set[str]:
-        db = self.ctx.db
-        assert db is not None
-        rows = await db.fetchall("SELECT uniq FROM maildir_seen WHERE account = ? AND folder = ?", (self.ctx.name, folder))
-        return {r["uniq"] for r in rows}
+        store = self.ctx.store
+        if store is None:
+            raise PluginError("maildir: no record store is available to keep what it has synced")
+        try:
+            rec = await store.get(SEEN_COLLECTION, self._rid(folder))
+        except NotFound:
+            return set()
+        seen = rec.data.get("seen")
+        if not isinstance(seen, list):
+            log.warning("maildir record not understood; reading the folder again")
+            return set()
+        return {str(u) for u in seen}
 
-    async def _keep(self, folder: str, uniqs: list[str]) -> None:
-        db = self.ctx.db
-        assert db is not None
-        await db.executemany("INSERT OR IGNORE INTO maildir_seen (account, folder, uniq) VALUES (?,?,?)", [(self.ctx.name, folder, u) for u in uniqs])
-
-    async def _forget(self, folder: str, uniqs: set[str]) -> None:
-        db = self.ctx.db
-        assert db is not None
-        await db.executemany("DELETE FROM maildir_seen WHERE account = ? AND folder = ? AND uniq = ?", [(self.ctx.name, folder, u) for u in uniqs])
+    async def _keep(self, folder: str, seen: set[str]) -> None:
+        store = self.ctx.store
+        assert store is not None
+        data = {"account": self.ctx.name, "folder": folder, "seen": sorted(seen)}
+        try:
+            await store.update(SEEN_COLLECTION, self._rid(folder), data)
+        except NotFound:
+            await store.create(SEEN_COLLECTION, data, id=self._rid(folder))
 
     # -- syncing: a scheduled job, so it shows in the stage's jobs, is retried, and lands in Failed jobs with a Requeue button -----
     def job_handlers(self) -> list[PluginJobHandler]:
@@ -161,10 +173,10 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
                 break
             present = await asyncio.to_thread(tree.messages, where)
             seen = await self._seen(folder)
-            gone = seen - {m.uniq for m in present}
-            if gone:
-                await self._forget(folder, gone)  # deleted or moved away: the set stays the size of the folder
-            page: list[str] = []
+            here = {m.uniq for m in present}
+            changed = bool(seen - here)
+            seen &= here  # deleted or moved away: the record stays the size of the folder
+            pending = 0
             for m in present:
                 if m.uniq in seen:
                     continue
@@ -186,12 +198,13 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
                 await self.submit({"base64": base64.b64encode(raw).decode()}, source=f"maildir:{name}", key=f"maildir:{name}:{folder}:{m.uniq}",
                                   format="rfc822", labels=labels)  # fmt: skip
                 sent += 1
-                page.append(m.uniq)
-                if len(page) >= PAGE:
-                    await self._keep(folder, page)
-                    page = []
-            if page:
-                await self._keep(folder, page)
+                seen.add(m.uniq)
+                pending += 1
+                if pending >= PAGE:
+                    await self._keep(folder, seen)
+                    pending, changed = 0, False
+            if pending or changed:
+                await self._keep(folder, seen)
         if too_big:
             log.warning("maildir skipped %d message(s) bigger than max_message_bytes", too_big)
         if skipped:
