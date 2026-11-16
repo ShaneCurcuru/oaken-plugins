@@ -264,6 +264,30 @@ def test_tmp_dotfiles_and_symlinks_are_never_read(tmp_path: Path, root: Path) ->
     assert [m.uniq for m in tree.messages(root)] == ["1700000001.M1P1.host"]
 
 
+def test_a_file_swapped_for_a_link_or_grown_after_the_listing_is_not_read(tmp_path: Path, root: Path) -> None:
+    p = drop(root, 1)
+    assert tree.read(p, 1 << 20) == mail(1)
+    assert tree.read(p, 10) is None  # bigger than the limit now: only limit + 1 bytes were read
+    outside = tmp_path / "secret.txt"
+    outside.write_text("not for the provider")
+    p.unlink()
+    p.symlink_to(outside)
+    with pytest.raises(OSError):
+        tree.read(p, 1 << 20)
+
+
+async def test_a_linked_maildir_path_is_followed_but_nothing_inside_it_is(tmp_path: Path) -> None:
+    real = maildir(tmp_path / "RealMail")
+    drop(real, 1)
+    (tmp_path / "Mail").symlink_to(real)  # ~/Maildir is often a link to another disk
+    c = await make_core(tmp_path)
+    try:
+        await sync(c)
+        assert (await stored(c)).total == 1
+    finally:
+        await c.host.stop()
+
+
 def test_a_message_seen_in_new_and_cur_at_once_counts_once(root: Path) -> None:
     drop(root, 1)
     drop(root, 1, "cur", "S")

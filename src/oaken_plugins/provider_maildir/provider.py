@@ -101,7 +101,7 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
 
     @property
     def _root(self) -> Path:
-        return Path(self.config.path).expanduser()
+        return Path(self.config.path).expanduser().resolve()  # the path you give may be a link; nothing inside it is followed
 
     async def health(self) -> Health:
         root = self._root
@@ -154,7 +154,7 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
             return await live._sync_job(jctx, payload)
         name, limit = self.ctx.name, self.config.max_per_sync
         labels = {"confidential": "true"} if self.config.confidential else None
-        sent = too_big = 0
+        sent = too_big = skipped = 0
         folders = await self._folders()
         for folder, where in folders.items():
             if sent >= limit:
@@ -174,9 +174,15 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
                     too_big += 1  # never read, and not recorded: raise the limit and the next sync takes it
                     continue
                 try:
-                    raw = await asyncio.to_thread(m.path.read_bytes)
+                    raw = await asyncio.to_thread(tree.read, m.path, self.config.max_message_bytes)
                 except FileNotFoundError:
                     continue  # renamed (a flag change) or moved since the listing: the next sync finds it by its new name
+                except OSError:
+                    skipped += 1  # a link put in its place, or unreadable: never read, never recorded
+                    continue
+                if raw is None:
+                    too_big += 1  # grew past the limit since the listing
+                    continue
                 await self.submit({"base64": base64.b64encode(raw).decode()}, source=f"maildir:{name}", key=f"maildir:{name}:{folder}:{m.uniq}",
                                   format="rfc822", labels=labels)  # fmt: skip
                 sent += 1
@@ -188,6 +194,8 @@ class MaildirProvider(BaseTemplatePlugin, BaseProvider):
                 await self._keep(folder, page)
         if too_big:
             log.warning("maildir skipped %d message(s) bigger than max_message_bytes", too_big)
+        if skipped:
+            log.warning("maildir skipped %d message file(s) it could not open as plain files", skipped)
         return SyncOut(submitted=sent, folders=len(folders), skipped_too_big=too_big, more=sent >= limit)
 
     # -- a look before the first sync ---------------------------------------------------------

@@ -106,3 +106,12 @@ def messages(folder: Path) -> list[Message]:
             if uniq and uniq not in seen:
                 seen[uniq] = Message(uniq, Path(e.path), st.st_size, st.st_mtime)
     return sorted(seen.values(), key=lambda m: (m.mtime, m.uniq))
+
+
+def read(path: Path, limit: int) -> bytes | None:
+    """The file's bytes, or None if it is bigger than ``limit`` now. Opened without following a link (one could have been put in its
+    place since the listing), and read only up to the limit, so a file that grew since its size was taken is still never read whole."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(limit + 1)
+    return None if len(data) > limit else data
